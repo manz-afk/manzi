@@ -80,19 +80,6 @@ jobs:
             mv "$tmp" project
           fi
 
-      - name: Pulihkan struktur folder (file datar)
-        working-directory: project
-        run: |
-          shopt -s nullglob
-          for f in *__*; do
-            [ -f "$f" ] || continue
-            d="$(echo "$f" | sed 's|__|/|g')"
-            mkdir -p "$(dirname "$d")"
-            mv "$f" "$d"
-          done
-          echo "Isi root project setelah dipulihkan:"
-          ls -la
-
       - name: Validasi pubspec.yaml
         run: |
           if [ ! -f project/pubspec.yaml ]; then
@@ -100,32 +87,34 @@ jobs:
             exit 1
           fi
 
+      # Project tanpa folder android/ (mis. NEXVORA) dibuatkan otomatis.
+      # Project yang sudah punya android/ tidak disentuh sama sekali.
+      - name: Buat folder android (kalau belum ada)
+        working-directory: project
+        run: |
+          if [ -f android/app/src/main/AndroidManifest.xml ]; then
+            echo "android/ sudah ada, dilewati."
+          elif [ -f tools/make_android.sh ]; then
+            bash tools/make_android.sh
+          else
+            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
+            TMP=$(mktemp -d)
+            flutter create --platforms android --project-name "${NAME:-app}" "$TMP/nx"
+            rm -rf android
+            cp -r "$TMP/nx/android" android
+          fi
+
       - name: Flutter pub get
         working-directory: project
         run: flutter pub get
 
-      - name: Perbaiki proguard plugin lama
-        working-directory: project
-        run: |
-          PUBC="${PUB_CACHE:-$HOME/.pub-cache}"
-          { grep -rl "proguard-android.txt" "$PUBC" --include=build.gradle --include=build.gradle.kts 2>/dev/null || true; } \
-            | xargs -r sed -i 's/proguard-android\.txt/proguard-android-optimize.txt/g' || true
-
       - name: Build APK
         working-directory: project
         run: |
-          if [ -f tools/build.sh ]; then
-            NO_WIDGET=1 bash tools/build.sh
-            mkdir -p build/app/outputs/flutter-apk
-            APK="$(find dist -name '*.apk' | head -n 1)"
-            [ -n "$APK" ] || { echo "::error::APK tidak ditemukan di dist/"; exit 1; }
-            cp "$APK" build/app/outputs/flutter-apk/app-release.apk
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
           else
-            if [ "${{ inputs.build_type }}" = "debug" ]; then
-              flutter build apk --debug
-            else
-              flutter build apk --release
-            fi
+            flutter build apk --release
           fi
 
       - name: Upload APK sebagai artifact
