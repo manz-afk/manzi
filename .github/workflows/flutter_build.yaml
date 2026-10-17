@@ -126,7 +126,7 @@ jobs:
           if [ "${{ inputs.build_type }}" = "debug" ]; then
             flutter build apk --debug
           else
-            flutter build apk --release --split-per-abi
+            flutter build apk --release --target-platform android-arm64
           fi
 
       - name: Bungkus APK jadi ZIP
@@ -146,8 +146,12 @@ jobs:
           zip -j "out/apk-${SAFE_TAG}.zip" "${APKS[@]}"
           ls -la out
 
+      # Nama artifact HARUS mengandung kata "apk" atau "build" - dibaca oleh bot
       - name: Upload ZIP sebagai artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Nama HARUS mengandung kata "apk
+          name: apk-${{ inputs.tag }}
+          path: out/*.zip
+          if-no-files-found: warn
+          retention-days: 1
