@@ -1,0 +1,219 @@
+name: Flutter Build APK
+
+# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
+# Input dikirim oleh server.js -> triggerWorkflow(). Simpan file ini di repo target
+# (GITHUB_OWNER/GITHUB_REPO di .env bot) pada path: .github/workflows/flutter_build.yml
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag unik build (dipakai untuk nama artifact & release cleanup)"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build: debug atau release"
+        required: false
+        default: "release"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Input dari bot dipakai lewat env (bukan ${{ }} di run) supaya tidak bisa disisipi perintah shell
+      - name: Validasi input wajib
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          TAG_IN: ${{ inputs.tag }}
+        run: |
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::Input zip_url kosong."
+            exit 1
+          fi
+          if [ -z "$TAG_IN" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # PENTING — JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
+      # di project kamu sudah di-upgrade ke v11+. Flutter 3.44 menjadikan class
+      # IconData "final" (tidak bisa di-extend), yang membuat font_awesome_flutter
+      # versi lama (mis. 10.12.0) gagal compile dengan error:
+      #   "The class 'IconData' can't be extended outside of its library
+      #    because it's a final class."
+      # 3.41.x adalah rilis stabil terakhir SEBELUM breaking change tersebut.
+      - name: Setup Flutter SDK (pinned 3.41.x, sebelum breaking change IconData final)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Download ZIP project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: curl -L --fail -o project.zip "$ZIP_URL"
+
+      - name: Extract ZIP
+        run: |
+          rm -rf project
+          mkdir -p project
+          unzip -q project.zip -d project
+
+          # Kalau isi ZIP cuma 1 folder pembungkus di root, naikkan isinya
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp=$(mktemp -d)
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+
+      - name: Validasi pubspec.yaml
+        run: |
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter yang valid (pubspec.yaml di root project)."
+            exit 1
+          fi
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      # Ikon launcher dari assets/logo.png (latar putih + jarak aman) dan
+      # warna splash/window gelap sesuai tema app, supaya tidak ada kilatan hitam/putih.
+      - name: Ikon launcher dan splash gelap
+        working-directory: project
+        run: |
+          RES=android/app/src/main/res
+          if [ -f assets/logo.png ]; then
+            pip install pillow >/dev/null 2>&1 || true
+            python3 - <<'PYEOF'
+          import os
+          from PIL import Image, ImageDraw
+          src = Image.open("assets/logo.png").convert("RGB")
+          SIZES = [("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)]
+          for name, sz in SIZES:
+              d = os.path.join("android/app/src/main/res", "mipmap-" + name)
+              os.makedirs(d, exist_ok=True)
+              pad = int(sz * 0.12)
+              inner = sz - pad * 2
+              base = Image.new("RGB", (sz, sz), (255, 255, 255))
+              base.paste(src.resize((inner, inner), Image.LANCZOS), (pad, pad))
+              base.save(os.path.join(d, "ic_launcher.png"))
+              mask = Image.new("L", (sz * 4, sz * 4), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, sz * 4 - 1, sz * 4 - 1), fill=255)
+              mask = mask.resize((sz, sz), Image.LANCZOS)
+              rnd = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+              rnd.paste(base, (0, 0), mask)
+              rnd.save(os.path.join(d, "ic_launcher_round.png"))
+          print("ikon launcher dibuat")
+          PYEOF
+          fi
+          mkdir -p $RES/values $RES/drawable $RES/drawable-v21
+          cat > $RES/values/nexvora_colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="nexvora_bg">#FF0E0E10</color>
+          </resources>
+          EOF
+          for f in $RES/drawable/launch_background.xml $RES/drawable-v21/launch_background.xml; do
+            cat > "$f" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:drawable="@color/nexvora_bg" />
+          </layer-list>
+          EOF
+          done
+          python3 - <<'PYEOF'
+          import glob, re
+          for f in glob.glob("android/app/src/main/res/values*/styles.xml"):
+              s = open(f, encoding="utf-8").read()
+              s2 = re.sub(r'<item name="android:windowBackground">[^<]*</item>',
+                          '<item name="android:windowBackground">@color/nexvora_bg</item>', s)
+              if s2 != s:
+                  open(f, "w", encoding="utf-8").write(s2)
+                  print("windowBackground gelap di", f)
+          PYEOF
+
+      # Perbaiki error R8: ML Kit mereferensikan kelas recognizer bahasa lain
+      # (Chinese/Japanese/Korean/Devanagari) yang tidak ikut di dependency.
+      # Aturan -dontwarn ini membuat R8 tetap aktif (APK tetap kecil).
+      - name: Atur ProGuard untuk ML Kit (perbaiki error R8)
+        working-directory: project
+        run: |
+          mkdir -p android/app
+          cat > android/app/proguard-rules.pro <<'EOF'
+          -dontwarn com.google.mlkit.vision.text.**
+          -dontwarn com.google.mlkit.vision.barcode.**
+          -keep class com.google.mlkit.** { *; }
+          -dontwarn com.google.android.gms.**
+          EOF
+          python3 - <<'PYEOF'
+          import glob, re
+          for f in glob.glob("android/app/build.gradle*"):
+              s = open(f, encoding="utf-8").read()
+              if "proguard-rules.pro" in s:
+                  continue
+              if f.endswith(".kts"):
+                  block = '\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")'
+              else:
+                  block = "\n            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'"
+              s2 = re.sub(r"(buildTypes\s*\{\s*release\s*\{)", lambda m: m.group(1) + block, s, count=1)
+              if s2 != s:
+                  open(f, "w", encoding="utf-8").write(s2)
+                  print("proguard dipasang di", f)
+          PYEOF
+
+      - name: Build APK
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release --target-platform android-arm64
+          fi
+
+      - name: Bungkus APK jadi ZIP
+        if: always()
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          APKS=(project/build/app/outputs/flutter-apk/*.apk)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::warning::APK tidak ditemukan, tidak ada ZIP yang dibuat."
+            exit 0
+          fi
+          SAFE_TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9._-' '_')"
+          mkdir -p out
+          zip -j "out/apk-${SAFE_TAG}.zip" "${APKS[@]}"
+          ls -la out
+
+      # Nama artifact HARUS mengandung kata "apk" atau "build" - dibaca oleh bot
+      - name: Upload ZIP sebagai artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: out/*.zip
+          if-no-files-found: warn
+          retention-days: 1
