@@ -95,6 +95,43 @@ jobs:
         working-directory: project
         run: flutter pub get
 
+      # Cek embedding v1: hapus FlutterApplication dari manifest (sisa v1),
+      # lalu hentikan build dengan nama plugin yang masih memakai v1 (kalau ada).
+      - name: Cek dan bersihkan embedding v1
+        working-directory: project
+        run: |
+          python3 - <<'PYEOF'
+          import glob, json, os, re, sys
+          for m in glob.glob("android/app/src/main/AndroidManifest.xml"):
+              s = open(m, encoding="utf-8").read()
+              s2 = re.sub(r'\s*android:name="io\.flutter\.app\.FlutterApplication"', '', s)
+              if s2 != s:
+                  open(m, "w", encoding="utf-8").write(s2)
+                  print("FlutterApplication dihapus dari", m)
+          f = ".flutter-plugins-dependencies"
+          if not os.path.exists(f):
+              print("file .flutter-plugins-dependencies tidak ada, cek dilewati")
+              sys.exit(0)
+          d = json.load(open(f, encoding="utf-8"))
+          bad = []
+          for p in d.get("plugins", {}).get("android", []):
+              for dp, _, fns in os.walk(os.path.join(p["path"], "android")):
+                  for fn in fns:
+                      if fn.endswith((".java", ".kt")):
+                          t = open(os.path.join(dp, fn), encoding="utf-8", errors="ignore").read()
+                          if "PluginRegistry.Registrar" in t or "registerWith(" in t:
+                              bad.append(f'{p["name"]} {p.get("version")}')
+                              break
+                  else:
+                      continue
+                  break
+          if bad:
+              print("::error::Plugin masih memakai Android v1 embedding: " + ", ".join(sorted(set(bad))))
+              print("::error::Naikkan atau ganti versi plugin tersebut di pubspec.yaml.")
+              sys.exit(1)
+          print("tidak ada plugin v1, lanjut")
+          PYEOF
+
       # Ikon launcher dari assets/logo.png (latar putih + jarak aman) dan
       # warna splash/window gelap sesuai tema app, supaya tidak ada kilatan hitam/putih.
       - name: Ikon launcher dan splash gelap
