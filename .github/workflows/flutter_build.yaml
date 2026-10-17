@@ -3,6 +3,12 @@ name: Flutter Build APK
 # Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
 # Input dikirim oleh server.js -> triggerWorkflow(). Simpan file ini di repo target
 # (GITHUB_OWNER/GITHUB_REPO di .env bot) pada path: .github/workflows/flutter_build.yml
+#
+# Versi ini fokus ke APK KECIL supaya cepat diambil dan dikirim bot:
+#   - selalu build RELEASE (build debug bisa ratusan MB)
+#   - hanya arm64-v8a, library native dikompres di dalam APK, simbol debug dipisah
+#   - format artifact SAMA seperti workflow lama: "apk-<tag>" berisi 1 file .apk
+#     (tanpa ZIP di dalam ZIP; GitHub sendiri sudah membungkus artifact jadi ZIP)
 on:
   workflow_dispatch:
     inputs:
@@ -15,7 +21,7 @@ on:
         required: true
         type: string
       build_type:
-        description: "Mode build: debug atau release"
+        description: "Diabaikan: build selalu release supaya APK kecil. Dipertahankan agar cocok dengan bot."
         required: false
         default: "release"
         type: string
@@ -28,13 +34,17 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # Input dari bot dibaca lewat env (bukan ${{ }} di dalam run) supaya tidak bisa disisipi perintah shell
       - name: Validasi input wajib
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          TAG_IN: ${{ inputs.tag }}
         run: |
-          if [ -z "${{ inputs.zip_url }}" ]; then
+          if [ -z "$ZIP_URL" ]; then
             echo "::error::Input zip_url kosong."
             exit 1
           fi
-          if [ -z "${{ inputs.tag }}" ]; then
+          if [ -z "$TAG_IN" ]; then
             echo "::error::Input tag kosong."
             exit 1
           fi
@@ -45,7 +55,7 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      # PENTING — JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
+      # PENTING - JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
       # di project kamu sudah di-upgrade ke v11+. Flutter 3.44 menjadikan class
       # IconData "final" (tidak bisa di-extend), yang membuat font_awesome_flutter
       # versi lama (mis. 10.12.0) gagal compile dengan error:
@@ -80,6 +90,24 @@ jobs:
             mv "$tmp" project
           fi
 
+      # ZIP datar (semua file di satu level, nama pakai "__" sebagai pemisah folder)
+      # dikembalikan ke struktur folder. Dilewati kalau folder lib/ sudah ada.
+      - name: Pulihkan struktur folder (ZIP datar)
+        working-directory: project
+        run: |
+          if [ -d lib ]; then
+            echo "Struktur folder sudah benar, dilewati."
+            exit 0
+          fi
+          shopt -s nullglob dotglob
+          for f in *__*; do
+            [ -f "$f" ] || continue
+            d="${f//__//}"
+            mkdir -p "$(dirname "$d")"
+            mv "$f" "$d"
+          done
+          echo "Struktur folder dipulihkan."
+
       - name: Validasi pubspec.yaml
         run: |
           if [ ! -f project/pubspec.yaml ]; then
@@ -87,19 +115,118 @@ jobs:
             exit 1
           fi
 
+      # Menyiapkan folder android/ dan mengecilkan ukuran APK (fitur aplikasi tidak berubah).
+      # Project Nexvora punya tools/make_android.sh (ikon NEXVOR, splash gelap, izin, pengecilan).
+      # Project lain: android/ dibuat dengan flutter create kalau belum ada.
+      - name: Siapkan android dan pengecilan ukuran
+        working-directory: project
+        run: |
+          set -euo pipefail
+
+          # Perbaiki error "Not found: package:home_widget": paketnya tidak ada di pubspec tapi masih di-import
+          if [ -f lib/core/widget_sync.dart ] && grep -q "package:home_widget" lib/core/widget_sync.dart \
+             && ! grep -q "home_widget:" pubspec.yaml; then
+            printf 'Future<void> syncWidget() async {}\n' > lib/core/widget_sync.dart
+            echo "widget_sync.dart diganti versi kosong (home_widget tidak ada di pubspec)."
+          fi
+
+          if [ -f android/app/src/main/AndroidManifest.xml ]; then
+            echo "android/ sudah ada, tidak dibuat ulang."
+          elif [ -f tools/make_android.sh ]; then
+            bash tools/make_android.sh
+          else
+            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
+            TMP=$(mktemp -d)
+            flutter create --platforms android --project-name "${NAME:-app}" "$TMP/nx"
+            rm -rf android
+            cp -r "$TMP/nx/android" android
+          fi
+
+          # Pengecilan ukuran: aman dijalankan ulang, kalau sudah terpasang tidak ada yang berubah
+          cat > "$RUNNER_TEMP/shrink_android.py" <<'PYEOF'
+          # Mengecilkan APK TANPA mengubah isi/fitur aplikasi:
+          #  1) hanya arsitektur arm64-v8a (library native arsitektur lain, termasuk milik plugin, tidak ikut)
+          #  2) library native dikompres di dalam APK (useLegacyPackaging) -> APK jauh lebih kecil
+          # Pemakaian: python3 shrink_android.py <folder android> [--revert]
+          #   --revert mengembalikan build.gradle ke kondisi sebelum pengecilan (dipakai kalau build gagal)
+          import glob, os, re, shutil, sys
+
+          android = sys.argv[1]
+          revert = "--revert" in sys.argv[2:]
+          files = [f for f in glob.glob(os.path.join(android, "app", "build.gradle*"))
+                   if not f.endswith(".noshrink")]
+
+          if revert:
+              for f in files:
+                  bak = f + ".noshrink"
+                  if os.path.exists(bak):
+                      shutil.copyfile(bak, f)
+                      print("pengecilan ukuran dibatalkan di", f)
+              sys.exit(0)
+
+          for f in files:
+              s = open(f, encoding="utf-8").read()
+              orig = s
+              if "abiFilters" not in s:
+                  s = re.sub(r"(defaultConfig\s*\{)",
+                             lambda m: m.group(1) + '\n        ndk {\n            abiFilters.add("arm64-v8a")\n        }',
+                             s, count=1)
+              if "useLegacyPackaging" not in s:
+                  s = re.sub(r"^(android\s*\{)",
+                             lambda m: m.group(1) + "\n    packaging {\n        jniLibs {\n"
+                                                    "            useLegacyPackaging = true\n        }\n    }\n",
+                             s, count=1, flags=re.M)
+              if s != orig:
+                  bak = f + ".noshrink"
+                  if not os.path.exists(bak):
+                      open(bak, "w", encoding="utf-8").write(orig)
+                  open(f, "w", encoding="utf-8").write(s)
+                  print("pengecilan ukuran dipasang di", f)
+              else:
+                  print("tidak ada perubahan di", f)
+          PYEOF
+          python3 "$RUNNER_TEMP/shrink_android.py" android
+
       - name: Flutter pub get
         working-directory: project
         run: flutter pub get
 
-      - name: Build APK
+      # Plugin lama (mis. flutter_inappwebview_android) memakai proguard-android.txt yang ditolak AGP baru.
+      # Langkah ini TIDAK boleh menghentikan build.
+      - name: Perbaiki proguard plugin lama
         working-directory: project
         run: |
-          if [ "${{ inputs.build_type }}" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release
+          PUBC="${PUB_CACHE:-$HOME/.pub-cache}"
+          { grep -rl "proguard-android.txt" "$PUBC" --include=build.gradle --include=build.gradle.kts 2>/dev/null || true; } \
+            | xargs -r sed -i 's/proguard-android\.txt/proguard-android-optimize.txt/g' || true
+
+      - name: Build APK (release, kecil)
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            echo "::warning::build_type=debug diabaikan: selalu build release supaya APK kecil dan cepat terkirim."
+          fi
+          ARGS=(--release --target-platform android-arm64)
+          if ! flutter build apk "${ARGS[@]}" --split-debug-info=build/symbols; then
+            echo "::warning::Build dengan pengecilan ukuran gagal, mengulang tanpa pengecilan ukuran."
+            python3 "$RUNNER_TEMP/shrink_android.py" android --revert
+            flutter build apk "${ARGS[@]}"
           fi
 
+      # Hanya laporan di log (tidak menghentikan build): ukuran APK dan isi terbesarnya
+      - name: Laporan ukuran APK
+        if: success()
+        run: |
+          APK="$(ls project/build/app/outputs/flutter-apk/*.apk | head -n 1)"
+          ls -lh "$APK"
+          echo "10 isi terbesar di dalam APK (ukuran terkompresi):"
+          unzip -lv "$APK" | awk '$1 ~ /^[0-9]+$/ && $NF != "files" {print $3, $NF}' | sort -n -r | head -n 10 \
+            | awk '{printf "%8.1f MB  %s\n", $1/1048576, $2}' || true
+
+      # Nama artifact HARUS mengandung kata "apk" atau "build" - dibaca oleh bot
       - name: Upload APK sebagai artifact
         if: always()
         uses: actions/upload-artifact@v4
