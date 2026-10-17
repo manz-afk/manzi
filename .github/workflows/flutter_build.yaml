@@ -87,26 +87,38 @@ jobs:
             exit 1
           fi
 
-      # Project tanpa folder android/ (mis. NEXVORA) dibuatkan otomatis.
-      # Project yang sudah punya android/ tidak disentuh sama sekali.
-      - name: Buat folder android (kalau belum ada)
-        working-directory: project
-        run: |
-          if [ -f android/app/src/main/AndroidManifest.xml ]; then
-            echo "android/ sudah ada, dilewati."
-          elif [ -f tools/make_android.sh ]; then
-            bash tools/make_android.sh
-          else
-            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
-            TMP=$(mktemp -d)
-            flutter create --platforms android --project-name "${NAME:-app}" "$TMP/nx"
-            rm -rf android
-            cp -r "$TMP/nx/android" android
-          fi
-
       - name: Flutter pub get
         working-directory: project
         run: flutter pub get
+
+      # Perbaiki error R8: ML Kit mereferensikan kelas recognizer bahasa lain
+      # (Chinese/Japanese/Korean/Devanagari) yang tidak ikut di dependency.
+      # Aturan -dontwarn ini membuat R8 tetap aktif (APK tetap kecil).
+      - name: Atur ProGuard untuk ML Kit (perbaiki error R8)
+        working-directory: project
+        run: |
+          mkdir -p android/app
+          cat > android/app/proguard-rules.pro <<'EOF'
+          -dontwarn com.google.mlkit.vision.text.**
+          -dontwarn com.google.mlkit.vision.barcode.**
+          -keep class com.google.mlkit.** { *; }
+          -dontwarn com.google.android.gms.**
+          EOF
+          python3 - <<'PYEOF'
+          import glob, re
+          for f in glob.glob("android/app/build.gradle*"):
+              s = open(f, encoding="utf-8").read()
+              if "proguard-rules.pro" in s:
+                  continue
+              if f.endswith(".kts"):
+                  block = '\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")'
+              else:
+                  block = "\n            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'"
+              s2 = re.sub(r"(buildTypes\s*\{\s*release\s*\{)", lambda m: m.group(1) + block, s, count=1)
+              if s2 != s:
+                  open(f, "w", encoding="utf-8").write(s2)
+                  print("proguard dipasang di", f)
+          PYEOF
 
       - name: Build APK
         working-directory: project
@@ -114,7 +126,7 @@ jobs:
           if [ "${{ inputs.build_type }}" = "debug" ]; then
             flutter build apk --debug
           else
-            flutter build apk --release
+            flutter build apk --release --split-per-abi
           fi
 
       - name: Bungkus APK jadi ZIP
@@ -138,8 +150,4 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Nama HARUS mengandung kata "apk" atau "build" - dibaca oleh bot
-          name: apk-${{ inputs.tag }}
-          path: out/*.zip
-          if-no-files-found: warn
-          retention-days: 1
+          # Nama HARUS mengandung kata "apk
